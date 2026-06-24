@@ -1,0 +1,8 @@
+node-bridge/node_modules/
+node-bridge/npm-debug.log*
+node-bridge/yarn-debug.log*
+node-bridge/yarn-error.log*
+.env
+.env.*
+*.log
+*.elc
