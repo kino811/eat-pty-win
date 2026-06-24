@@ -63,8 +63,8 @@ function flushInput(term, pending, final) {
       return;
     }
 
-    const nextEscape = pending.value.indexOf('\x1b');
-    const count = nextEscape < 0 ? pending.value.length : Math.max(1, nextEscape);
+    const nextEscape = pending.value.indexOf('\x1b', 1);
+    const count = nextEscape < 0 ? pending.value.length : nextEscape;
     term.write(pending.value.slice(0, count));
     pending.value = pending.value.slice(count);
   }
