@@ -21,8 +21,9 @@
   :type 'file)
 
 (defcustom eat-pty-win-bridge-args
-  (let ((node-bridge (expand-file-name "eat-pty-win/node-bridge/conpty-node-bridge.js"
-                                       user-emacs-directory)))
+  (let ((node-bridge (expand-file-name "node-bridge/conpty-node-bridge.js"
+                                       (file-name-directory
+                                        (or load-file-name buffer-file-name)))))
     (when (and (executable-find "node.exe")
                (file-exists-p node-bridge))
       (list node-bridge)))
@@ -53,16 +54,319 @@ The default nil keeps the user's PowerShell profile setting."
   :type '(choice (const :tag "Keep profile setting" nil)
                  (string :tag "PSReadLine edit mode")))
 
+(defcustom eat-pty-win-output-throttle-delay 0.005
+  "Seconds to wait between bounded terminal output drain passes.
+
+This keeps Emacs responsive when full-screen TUIs redraw continuously."
+  :type 'number)
+
+(defcustom eat-pty-win-output-chunk-size 4096
+  "Maximum bytes of terminal output rendered in one drain pass."
+  :type 'integer)
+
+(defcustom eat-pty-win-output-drain-time-budget 0.02
+  "Maximum seconds spent rendering terminal output in one timer pass."
+  :type 'number)
+
+(defcustom eat-pty-win-output-ack-delay 0.0
+  "Seconds to wait before ACKing a rendered output chunk to the bridge.
+
+The delay lets Emacs return to the command loop and perform GUI redisplay before
+the bridge is allowed to send the next chunk."
+  :type 'number)
+
+(defcustom eat-pty-win-output-filter-rate-limit 120
+  "Maximum process filter calls per second before pausing bridge output."
+  :type 'integer)
+
+(defcustom eat-pty-win-output-pause-duration 0.1
+  "Seconds to pause bridge output after detecting continuous redraw overload."
+  :type 'number)
+
+(defcustom eat-pty-win-output-max-pending-bytes (* 64 1024)
+  "Maximum queued terminal output bytes before old output is dropped."
+  :type 'integer)
+
+(defcustom eat-pty-win-strip-unsafe-output-sequences t
+  "Non-nil means bridge strips DCS/Sixel/OSC/APC/PM string controls before Eat."
+  :type 'boolean)
+
+(defcustom eat-pty-win-sanitize-ui-glyphs 'auto
+  "Control whether bridge replaces risky TUI drawing glyphs with ASCII.
+
+The default `auto' enables this only after AI CLI output is detected, preserving
+normal TUI rendering such as nvim.  The sanitizer preserves normal non-ASCII
+text such as Korean, but replaces box drawing and spinner symbols that have
+triggered Eat stalls on Windows."
+  :type '(choice (const :tag "Auto-detect AI CLI output" auto)
+                 (const :tag "Always enabled" t)
+                 (const :tag "Disabled" nil)))
+
 (defvar-local eat-pty-win--last-size nil)
+(defvar-local eat-pty-win--pending-output "")
+(defvar-local eat-pty-win--output-timer nil)
+(defvar-local eat-pty-win--output-dropped nil)
+(defvar-local eat-pty-win--saved-overriding-map-alist nil)
+(defvar-local eat-pty-win--emergency-keys-installed nil)
+(defvar-local eat-pty-win--filter-window-start nil)
+(defvar-local eat-pty-win--filter-window-count 0)
+(defvar-local eat-pty-win--bridge-paused nil)
+(defvar-local eat-pty-win--bridge-resume-timer nil)
+(defvar-local eat-pty-win--ack-timer nil)
 
 (defvar eat-pty-win-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c C-l") #'eat-line-mode)
     (define-key map (kbd "C-c C-j") #'eat-semi-char-mode)
     (define-key map (kbd "C-c M-d") #'eat-char-mode)
-    (define-key map (kbd "C-c C-k") #'eat-kill-process)
+    (define-key map (kbd "C-c C-k") #'eat-pty-win-kill-process)
     map)
   "Keymap for `eat-pty-win-mode'.")
+
+(defun eat-pty-win--cancel-output-timer ()
+  "Cancel the pending output drain timer in the current buffer."
+  (when eat-pty-win--output-timer
+    (cancel-timer eat-pty-win--output-timer)
+    (setq eat-pty-win--output-timer nil)))
+
+(defun eat-pty-win--clear-output-queue ()
+  "Clear queued terminal output in the current buffer."
+  (eat-pty-win--cancel-output-timer)
+  (setq eat-pty-win--pending-output "")
+  (setq eat-pty-win--output-dropped nil))
+
+(defun eat-pty-win--send-input (_ input)
+  "Send INPUT to subprocess."
+  (when-let* ((eat-terminal)
+              (proc (eat-term-parameter eat-terminal 'eat--process)))
+    (process-send-string proc input)))
+
+(defun eat-pty-win--cancel-bridge-resume-timer ()
+  "Cancel bridge resume timer in the current buffer."
+  (when eat-pty-win--bridge-resume-timer
+    (cancel-timer eat-pty-win--bridge-resume-timer)
+    (setq eat-pty-win--bridge-resume-timer nil)))
+
+(defun eat-pty-win--cancel-ack-timer ()
+  "Cancel pending output ACK timer in the current buffer."
+  (when eat-pty-win--ack-timer
+    (cancel-timer eat-pty-win--ack-timer)
+    (setq eat-pty-win--ack-timer nil)))
+
+(defun eat-pty-win--send-flow-command (process command)
+  "Send bridge flow-control COMMAND to PROCESS."
+  (when (process-live-p process)
+    (process-send-string process (format "\e]777;flow;%s\a" command))))
+
+(defun eat-pty-win--ack-output (process)
+  "Tell bridge that one output chunk has been rendered."
+  (eat-pty-win--send-flow-command process "ack"))
+
+(defun eat-pty-win--schedule-output-ack (buffer process)
+  "Schedule delayed ACK for PROCESS in BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (eat-pty-win--cancel-ack-timer)
+      (setq eat-pty-win--ack-timer
+            (run-at-time eat-pty-win-output-ack-delay nil
+                         (lambda (ack-buffer ack-process)
+                           (when (buffer-live-p ack-buffer)
+                             (with-current-buffer ack-buffer
+                               (setq eat-pty-win--ack-timer nil)
+                               (eat-pty-win--ack-output ack-process))))
+                         buffer process)))))
+
+(defun eat-pty-win--resume-bridge (buffer process)
+  "Resume bridge output for BUFFER and PROCESS."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq eat-pty-win--bridge-resume-timer nil)
+      (when eat-pty-win--bridge-paused
+        (setq eat-pty-win--bridge-paused nil)
+        (eat-pty-win--send-flow-command process "resume")))))
+
+(defun eat-pty-win--pause-bridge (process)
+  "Temporarily pause bridge output from PROCESS."
+  (unless eat-pty-win--bridge-paused
+    (setq eat-pty-win--bridge-paused t)
+    (eat-pty-win--clear-output-queue)
+    (eat-pty-win--send-flow-command process "pause")
+    (eat-pty-win--cancel-bridge-resume-timer)
+    (setq eat-pty-win--bridge-resume-timer
+          (run-at-time eat-pty-win-output-pause-duration nil
+                       #'eat-pty-win--resume-bridge
+                       (current-buffer) process))))
+
+(defun eat-pty-win--record-filter-call (process)
+  "Return non-nil when PROCESS output should be paused for overload."
+  (let ((now (float-time)))
+    (if (or (null eat-pty-win--filter-window-start)
+            (>= (- now eat-pty-win--filter-window-start) 1.0))
+        (setq eat-pty-win--filter-window-start now
+              eat-pty-win--filter-window-count 1)
+      (cl-incf eat-pty-win--filter-window-count))
+    (when (and (not eat-pty-win--bridge-paused)
+               (> eat-pty-win--filter-window-count
+                  eat-pty-win-output-filter-rate-limit))
+      (eat-pty-win--pause-bridge process)
+      t)))
+
+(defun eat-pty-win-kill-process ()
+  "Kill the current eat-pty-win process without draining queued output first."
+  (interactive)
+  (eat-pty-win--clear-output-queue)
+  (eat-pty-win--cancel-bridge-resume-timer)
+  (eat-pty-win--cancel-ack-timer)
+  (eat-kill-process))
+
+(defun eat-pty-win--emergency-keymap (base-map)
+  "Return BASE-MAP plus eat-pty-win emergency bindings."
+  (let ((map (copy-keymap base-map)))
+    (define-key map [?\C-c] (make-sparse-keymap))
+    (define-key map [?\C-c ?\C-k] #'eat-pty-win-kill-process)
+    (define-key map [?\C-c ?\C-e] #'eat-emacs-mode)
+    (define-key map [?\C-c ?\C-j] #'eat-semi-char-mode)
+    (define-key map [?\C-c ?\C-l] #'eat-line-mode)
+    (define-key map [?\C-c ?\M-d] #'eat-char-mode)
+    map))
+
+(defun eat-pty-win--install-emergency-keys ()
+  "Install buffer-local emergency bindings that win over Eat char maps."
+  (unless eat-pty-win--emergency-keys-installed
+    (setq eat-pty-win--saved-overriding-map-alist
+          minor-mode-overriding-map-alist)
+    (setq eat-pty-win--emergency-keys-installed t))
+  (setq-local
+   minor-mode-overriding-map-alist
+   (append
+    `((eat--char-mode . ,(eat-pty-win--emergency-keymap eat-char-mode-map))
+      (eat--semi-char-mode . ,(eat-pty-win--emergency-keymap
+                               eat-semi-char-mode-map)))
+    eat-pty-win--saved-overriding-map-alist)))
+
+(defun eat-pty-win--uninstall-emergency-keys ()
+  "Restore buffer-local emergency key overrides."
+  (when eat-pty-win--emergency-keys-installed
+    (setq-local minor-mode-overriding-map-alist
+                eat-pty-win--saved-overriding-map-alist)
+    (setq eat-pty-win--saved-overriding-map-alist nil)
+    (setq eat-pty-win--emergency-keys-installed nil)))
+
+(defun eat-pty-win--process-output-batch (process outputs)
+  "Render bounded OUTPUTS from PROCESS with one redisplay."
+  (when (buffer-live-p (process-buffer process))
+    (with-current-buffer (process-buffer process)
+      (let ((sync-windows (eat--synchronize-scroll-windows))
+            (eat--auto-line-mode-pending-toggles nil))
+        (save-restriction
+          (widen)
+          (let ((inhibit-read-only t)
+                (inhibit-modification-hooks t)
+                (buffer-undo-list t))
+            (when eat--process-output-queue-timer
+              (cancel-timer eat--process-output-queue-timer)
+              (setq eat--process-output-queue-timer nil))
+            (when eat--shell-prompt-annotation-correction-timer
+              (cancel-timer eat--shell-prompt-annotation-correction-timer)
+              (setq eat--shell-prompt-annotation-correction-timer nil))
+            (setq eat--output-queue-first-chunk-time nil)
+            (dolist (output outputs)
+              (eat-term-process-output eat-terminal output))
+            (eat-term-redisplay eat-terminal)
+            (when (and eat-term-scrollback-size
+                       (< eat-term-scrollback-size
+                          (- (point) (point-min))))
+              (delete-region
+               (point-min)
+               (max (point-min)
+                    (- (eat-term-display-beginning eat-terminal)
+                       eat-term-scrollback-size))))
+            (unless (> (length eat-pty-win--pending-output) 0)
+              (setq eat--shell-prompt-annotation-correction-timer
+                    (run-with-timer
+                     eat-shell-prompt-annotation-correction-delay
+                     nil #'eat--correct-shell-prompt-mark-overlays
+                     (current-buffer))))
+            (add-text-properties
+             (eat-term-beginning eat-terminal)
+             (eat-term-end eat-terminal)
+             `(read-only t field eat-terminal
+                         ,@(when eat--line-mode
+                             '(front-sticky t rear-nonsticky t))))))
+        (eat--line-mode-do-toggles)
+        (funcall eat--synchronize-scroll-function sync-windows)
+        (eat-pty-win--schedule-output-ack (current-buffer) process)
+        (run-hooks 'eat-update-hook)))))
+
+(defun eat-pty-win--drain-output (buffer process)
+  "Drain one queued output chunk for BUFFER from PROCESS."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq eat-pty-win--output-timer nil)
+      (when (and (process-live-p process)
+                 (> (length eat-pty-win--pending-output) 0)
+                 (not (input-pending-p)))
+        (let ((deadline (+ (float-time)
+                           eat-pty-win-output-drain-time-budget))
+              outputs)
+          (while (and (> (length eat-pty-win--pending-output) 0)
+                      (not (input-pending-p))
+                      (< (float-time) deadline))
+            (let* ((size (min eat-pty-win-output-chunk-size
+                              (length eat-pty-win--pending-output)))
+                   (output (substring eat-pty-win--pending-output 0 size)))
+              (setq eat-pty-win--pending-output
+                    (substring eat-pty-win--pending-output size))
+              (push output outputs)))
+          (when outputs
+            (eat-pty-win--process-output-batch process (nreverse outputs)))))
+      (when (> (length eat-pty-win--pending-output) 0)
+        (setq eat-pty-win--output-timer
+              (run-at-time eat-pty-win-output-throttle-delay nil
+                           #'eat-pty-win--drain-output
+                           buffer process))))))
+
+(defun eat-pty-win--schedule-output-drain (buffer process)
+  "Schedule bounded output draining for BUFFER and PROCESS."
+  (with-current-buffer buffer
+    (unless eat-pty-win--output-timer
+      (setq eat-pty-win--output-timer
+            (run-at-time eat-pty-win-output-throttle-delay nil
+                         #'eat-pty-win--drain-output
+                         buffer process)))))
+
+(defun eat-pty-win--filter (process output)
+  "Queue PROCESS OUTPUT and render it in bounded chunks."
+  (when (buffer-live-p (process-buffer process))
+    (with-current-buffer (process-buffer process)
+      (unless (eat-pty-win--record-filter-call process)
+        (when (> (length output) eat-pty-win-output-max-pending-bytes)
+          (setq output
+                (substring output
+                           (- (length output)
+                              eat-pty-win-output-max-pending-bytes))))
+        (setq eat-pty-win--pending-output
+              (concat eat-pty-win--pending-output output))
+        (when (> (length eat-pty-win--pending-output)
+                 eat-pty-win-output-max-pending-bytes)
+          (setq eat-pty-win--pending-output
+                (substring
+                 eat-pty-win--pending-output
+                 (- (length eat-pty-win--pending-output)
+                    eat-pty-win-output-max-pending-bytes)))
+          (unless eat-pty-win--output-dropped
+            (setq eat-pty-win--output-dropped t)
+            (message "eat-pty-win dropped old terminal output to keep Emacs responsive")))
+        (eat-pty-win--schedule-output-drain (current-buffer) process)))))
+
+(defun eat-pty-win--sentinel (process message)
+  "Sentinel for PROCESS with bounded-output cleanup before MESSAGE handling."
+  (when (buffer-live-p (process-buffer process))
+    (with-current-buffer (process-buffer process)
+      (eat-pty-win--cancel-bridge-resume-timer)
+      (eat-pty-win--cancel-ack-timer)
+      (eat-pty-win--clear-output-queue)))
+  (eat--sentinel process message))
 
 (defun eat-pty-win--eat-exec-direct (buffer name command switches)
   "Start COMMAND with SWITCHES in BUFFER without Eat's Unix shell wrapper."
@@ -71,6 +375,7 @@ The default nil keeps the user's PowerShell profile setting."
       (when-let* ((eat-terminal)
                   (proc (eat-term-parameter
                          eat-terminal 'eat--process)))
+        (eat-pty-win--clear-output-queue)
         (delete-process proc))
       (goto-char (point-max))
       (unless (or (= (point-min) (point-max))
@@ -85,7 +390,7 @@ The default nil keeps the user's PowerShell profile setting."
           (eat-term-resize eat-terminal (window-body-width)
                            (window-body-height))))
       (setf (eat-term-parameter eat-terminal 'input-function)
-            #'eat--send-input)
+            #'eat-pty-win--send-input)
       (setf (eat-term-parameter eat-terminal 'set-cursor-function)
             #'eat--set-cursor)
       (setf (eat-term-parameter eat-terminal 'grab-mouse-function)
@@ -107,7 +412,16 @@ The default nil keeps the user's PowerShell profile setting."
                 (concat "TERMINFO=" eat-term-terminfo-directory)
                 (concat "INSIDE_EMACS=" eat-term-inside-emacs)
                 (concat "EAT_SHELL_INTEGRATION_DIR="
-                        eat-term-shell-integration-directory))
+                        eat-term-shell-integration-directory)
+                (concat "EAT_PTY_WIN_STRIP_UNSAFE="
+                        (if eat-pty-win-strip-unsafe-output-sequences
+                            "1"
+                          "0"))
+                (concat "EAT_PTY_WIN_SANITIZE_UI_GLYPHS="
+                        (pcase eat-pty-win-sanitize-ui-glyphs
+                          ('auto "auto")
+                          ('nil "0")
+                          (_ "1"))))
                process-environment))
              (inhibit-eol-conversion t)
              (process
@@ -117,8 +431,8 @@ The default nil keeps the user's PowerShell profile setting."
                :command (cons command switches)
                :connection-type 'pipe
                :coding 'utf-8
-               :filter #'eat--filter
-               :sentinel #'eat--sentinel
+               :filter #'eat-pty-win--filter
+               :sentinel #'eat-pty-win--sentinel
                :file-handler t)))
         (process-put process 'adjust-window-size-function
                      #'eat--adjust-process-window-size)
@@ -188,6 +502,7 @@ The default nil keeps the user's PowerShell profile setting."
   (if eat-pty-win-mode
       (progn
         (display-line-numbers-mode -1)
+        (eat-pty-win--install-emergency-keys)
         (add-hook 'window-size-change-functions
                   #'eat-pty-win--window-size-change)
         (run-at-time 0.05 nil
@@ -197,7 +512,11 @@ The default nil keeps the user's PowerShell profile setting."
                            (eat-pty-win--send-resize))))
                      (current-buffer)))
     (remove-hook 'window-size-change-functions
-                 #'eat-pty-win--window-size-change)))
+                 #'eat-pty-win--window-size-change)
+    (eat-pty-win--cancel-bridge-resume-timer)
+    (eat-pty-win--cancel-ack-timer)
+    (eat-pty-win--clear-output-queue)
+    (eat-pty-win--uninstall-emergency-keys)))
 
 (defun eat-pty-win--display-buffer (buffer side-window)
   "Display BUFFER in the selected window or a right side window.
@@ -252,7 +571,7 @@ With C-u C-u, prompt for the shell command in the current window."
     (eat-pty-win-mode 1)
     (eat-pty-win--eat-exec-direct buffer "eat-pty-win"
                                 (eat-pty-win--bridge-executable) switches)
-    (eat-char-mode)
+    (eat-semi-char-mode)
     (eat-pty-win--send-resize)
     buffer))
 

@@ -5,6 +5,15 @@ const os = require('os');
 const pty = require('node-pty');
 
 const resizePrefix = '\x1b]777;resize;';
+const flowPrefix = '\x1b]777;flow;';
+const outputFlushIntervalMs = 5;
+const outputChunkSize = 4096;
+const outputHighWatermark = 64 * 1024;
+const outputLowWatermark = 16 * 1024;
+const outputMaxBuffer = 256 * 1024;
+const stripUnsafeSequences = process.env.EAT_PTY_WIN_STRIP_UNSAFE !== '0';
+const sanitizeUiGlyphsMode = process.env.EAT_PTY_WIN_SANITIZE_UI_GLYPHS || 'auto';
+let sanitizeUiGlyphsUntil = 0;
 
 function parseArgs(argv) {
   let cols = 120;
@@ -39,6 +48,29 @@ function parseArgs(argv) {
 
 function flushInput(term, pending, final) {
   while (pending.value.length > 0) {
+    if (pending.value.startsWith(flowPrefix)) {
+      const end = pending.value.indexOf('\x07');
+      if (end < 0) {
+        if (!final) return;
+        term.write(pending.value);
+        pending.value = '';
+        return;
+      }
+
+      const command = pending.value.slice(flowPrefix.length, end);
+      if (command === 'pause') {
+        pausePty();
+      } else if (command === 'resume') {
+        forceResumePty();
+      } else if (command === 'ack') {
+        acknowledgeOutput();
+      } else {
+        term.write(pending.value.slice(0, end + 1));
+      }
+      pending.value = pending.value.slice(end + 1);
+      continue;
+    }
+
     if (pending.value.startsWith(resizePrefix)) {
       const end = pending.value.indexOf('\x07');
       if (end < 0) {
@@ -59,7 +91,9 @@ function flushInput(term, pending, final) {
       continue;
     }
 
-    if (resizePrefix.startsWith(pending.value) && !final) {
+    if ((resizePrefix.startsWith(pending.value)
+         || flowPrefix.startsWith(pending.value))
+        && !final) {
       return;
     }
 
@@ -80,8 +114,146 @@ const term = pty.spawn(options.file, options.args, {
   useConpty: os.platform() === 'win32',
 });
 
+function stripUnsafeOutputSequences(data) {
+  if (!stripUnsafeSequences) {
+    return data;
+  }
+
+  return data
+    // DCS/Sixel and other device-control payloads can be very expensive in Eat.
+    .replace(/\x1bP[\s\S]*?(?:\x1b\\|\x9c)/g, '')
+    // OSC payloads include hyperlinks/title sequences; keep them out of Eat.
+    .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\|\x9c)/g, '')
+    // APC and PM string controls.
+    .replace(/\x1b_[\s\S]*?(?:\x1b\\|\x9c)/g, '')
+    .replace(/\x1b\^[\s\S]*?(?:\x1b\\|\x9c)/g, '');
+}
+
+function looksLikeAiCliOutput(data) {
+  return /\b(?:Copilot|Codex|OpenAI|ChatGPT|Claude|Gemini)\b|\/agentBrowse|\/model\b|\/approval\b|AI\s+CLI/i.test(data);
+}
+
+function shouldSanitizeUiGlyphs(data) {
+  if (sanitizeUiGlyphsMode === '1') {
+    return true;
+  }
+  if (sanitizeUiGlyphsMode === '0') {
+    return false;
+  }
+
+  if (looksLikeAiCliOutput(data)) {
+    sanitizeUiGlyphsUntil = Date.now() + 10 * 60 * 1000;
+    return true;
+  }
+
+  return Date.now() < sanitizeUiGlyphsUntil;
+}
+
+function sanitizeRiskyUiGlyphs(data) {
+  if (!shouldSanitizeUiGlyphs(data)) {
+    return data;
+  }
+
+  return data
+    .replace(/…/g, '...')
+    .replace(/[·•●○◉◎◆■□▪▫▴▾◂▸❯]/g, '*')
+    .replace(/[↑↓←→↕↔]/g, '*')
+    .replace(/[─━═]/g, '-')
+    .replace(/[│┃║]/g, '|')
+    .replace(/[┌┐└┘╭╮╰╯├┤┬┴┼╞╡╤╧╪╔╗╚╝╠╣╦╩╬]/g, '+')
+    .replace(/[\u2500-\u257F]/g, '+')
+    .replace(/[\u2580-\u259F]/g, ' ');
+}
+
+let outputBuffer = '';
+let outputTimer = null;
+let stdoutBlocked = false;
+let ptyPaused = false;
+let waitingForAck = false;
+
+function pausePty() {
+  if (!ptyPaused) {
+    term.pause();
+    ptyPaused = true;
+  }
+}
+
+function resumePtyIfSafe() {
+  if (ptyPaused && !stdoutBlocked && !waitingForAck && outputBuffer.length <= outputLowWatermark) {
+    term.resume();
+    ptyPaused = false;
+  }
+}
+
+function forceResumePty() {
+  waitingForAck = false;
+  if (ptyPaused && !stdoutBlocked) {
+    term.resume();
+    ptyPaused = false;
+  }
+  scheduleOutputFlush();
+}
+
+function acknowledgeOutput() {
+  waitingForAck = false;
+  resumePtyIfSafe();
+  scheduleOutputFlush();
+}
+
+function scheduleOutputFlush() {
+  if (outputTimer === null && !stdoutBlocked && !waitingForAck) {
+    outputTimer = setTimeout(flushOutput, outputFlushIntervalMs);
+  }
+}
+
+function flushOutput() {
+  outputTimer = null;
+
+  if (stdoutBlocked || waitingForAck) {
+    return;
+  }
+
+  if (outputBuffer.length === 0) {
+    resumePtyIfSafe();
+    return;
+  }
+
+  const chunk = outputBuffer.slice(0, outputChunkSize);
+  outputBuffer = outputBuffer.slice(outputChunkSize);
+
+  if (!process.stdout.write(chunk)) {
+    stdoutBlocked = true;
+    pausePty();
+    return;
+  }
+
+  waitingForAck = true;
+  pausePty();
+  resumePtyIfSafe();
+
+  if (outputBuffer.length > 0) {
+    scheduleOutputFlush();
+  }
+}
+
 term.onData((data) => {
-  process.stdout.write(data);
+  outputBuffer += sanitizeRiskyUiGlyphs(stripUnsafeOutputSequences(data));
+
+  if (outputBuffer.length > outputMaxBuffer) {
+    outputBuffer = outputBuffer.slice(outputBuffer.length - outputMaxBuffer);
+  }
+
+  if (outputBuffer.length >= outputHighWatermark) {
+    pausePty();
+  }
+
+  scheduleOutputFlush();
+});
+
+process.stdout.on('drain', () => {
+  stdoutBlocked = false;
+  resumePtyIfSafe();
+  scheduleOutputFlush();
 });
 
 term.onExit(({ exitCode }) => {
