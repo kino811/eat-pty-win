@@ -9,6 +9,59 @@
 
 (require 'cl-lib)
 (require 'eat)
+(require 'subr-x)
+
+(declare-function centered-cursor-mode "centered-cursor-mode")
+(declare-function hangul-alphabetp "hangul")
+(declare-function hangul-delete-backward-char "hangul")
+(declare-function hangul2-input-method-internal "hangul")
+(declare-function quail-setup-overlays "quail")
+
+(defvar eat-pty-win-mode)
+(defvar eat-pty-win--processing-output nil)
+
+(defun eat-pty-win--handle-output-interruptibly (handle output)
+  "Call HANDLE for OUTPUT while allowing `C-g' to interrupt Eat parsing."
+  (if eat-pty-win--processing-output
+      (let ((inhibit-quit nil))
+        (funcall handle output))
+    (funcall handle output)))
+
+(defun eat-pty-win--write-wide-chars-safely (write str &optional beg end)
+  "Call WRITE for STR without stalling on a wide character at the right edge."
+  (if (not eat-pty-win--processing-output)
+      (funcall write str beg end)
+    (let* ((start (or beg 0))
+           (end (or end (length str)))
+           (segment-beg start)
+           (index start))
+      (while (< index end)
+        (let ((width (char-width (aref str index))))
+          (if (= width 1)
+              (cl-incf index)
+            (when (< segment-beg index)
+              (funcall write str segment-beg index))
+            (when (> width 1)
+              (let* ((disp (eat--t-term-display eat--t-term))
+                     (cursor (eat--t-disp-cursor disp))
+                     (remaining
+                      (- (eat--t-disp-width disp)
+                         (1- (eat--t-cur-x cursor)))))
+                (when (and (> remaining 0)
+                           (< remaining width))
+                  (funcall write (make-string remaining ?\s)))))
+            (funcall write str index (1+ index))
+            (cl-incf index)
+            (setq segment-beg index))))
+      (when (< segment-beg end)
+        (funcall write str segment-beg end)))))
+
+(advice-remove 'eat--t-handle-output
+               #'eat-pty-win--handle-output-interruptibly)
+(advice-add 'eat--t-handle-output :around
+            #'eat-pty-win--handle-output-interruptibly)
+(advice-remove 'eat--t-write #'eat-pty-win--write-wide-chars-safely)
+(advice-add 'eat--t-write :around #'eat-pty-win--write-wide-chars-safely)
 
 (defgroup eat-pty-win nil
   "Windows ConPTY terminal integration."
@@ -75,6 +128,18 @@ The delay lets Emacs return to the command loop and perform GUI redisplay before
 the bridge is allowed to send the next chunk."
   :type 'number)
 
+(defcustom eat-pty-win-output-ack-timeout 3.0
+  "Seconds the bridge waits for an output ACK before remaining paused."
+  :type 'number)
+
+(defcustom eat-pty-win-diagnostic-file nil
+  "Optional file where the bridge records a chunk that did not receive an ACK.
+
+The file can contain terminal output, so leave this nil unless diagnosing a
+rendering stall."
+  :type '(choice (const :tag "Disabled" nil)
+                 (file :tag "Diagnostic file")))
+
 (defcustom eat-pty-win-output-filter-rate-limit 120
   "Maximum process filter calls per second before pausing bridge output."
   :type 'integer)
@@ -91,13 +156,13 @@ the bridge is allowed to send the next chunk."
   "Non-nil means bridge strips DCS/Sixel/OSC/APC/PM string controls before Eat."
   :type 'boolean)
 
-(defcustom eat-pty-win-sanitize-ui-glyphs 'auto
+(defcustom eat-pty-win-sanitize-ui-glyphs nil
   "Control whether bridge replaces risky TUI drawing glyphs with ASCII.
 
-The default `auto' enables this only after AI CLI output is detected, preserving
-normal TUI rendering such as nvim.  The sanitizer preserves normal non-ASCII
-text such as Korean, but replaces box drawing and spinner symbols that have
-triggered Eat stalls on Windows."
+The default nil preserves all Unicode output.  Set this to `auto' to enable
+sanitizing only after AI CLI output is detected, or t to enable it for all
+output.  The sanitizer preserves normal non-ASCII text such as Korean, but
+replaces box drawing and spinner symbols."
   :type '(choice (const :tag "Auto-detect AI CLI output" auto)
                  (const :tag "Always enabled" t)
                  (const :tag "Disabled" nil)))
@@ -113,9 +178,16 @@ triggered Eat stalls on Windows."
 (defvar-local eat-pty-win--bridge-paused nil)
 (defvar-local eat-pty-win--bridge-resume-timer nil)
 (defvar-local eat-pty-win--ack-timer nil)
+(defvar-local eat-pty-win--rendering-suspended nil)
+(defvar-local eat-pty-win--rendering-suspend-reason nil)
+(defvar-local eat-pty-win--hangul-buffer nil)
+(defvar-local eat-pty-win--hangul-displayed "")
+(defvar-local eat-pty-win--original-input-method-function nil)
 
 (defvar eat-pty-win-mode-map
   (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-g") #'keyboard-quit)
+    (define-key map (kbd "C-c C-c") #'eat-pty-win-send-ctrl-c)
     (define-key map (kbd "C-c C-l") #'eat-line-mode)
     (define-key map (kbd "C-c C-j") #'eat-semi-char-mode)
     (define-key map (kbd "C-c M-d") #'eat-char-mode)
@@ -219,10 +291,139 @@ triggered Eat stalls on Windows."
   (eat-pty-win--cancel-ack-timer)
   (eat-kill-process))
 
+(defun eat-pty-win-send-ctrl-c ()
+  "Send a literal Ctrl+C character to the terminal process."
+  (interactive)
+  (eat-pty-win--reset-hangul)
+  (eat-pty-win--send-text "\C-c"))
+
+(defun eat-pty-win--send-text (text)
+  "Send TEXT directly to the terminal process."
+  (unless (string-empty-p text)
+    (when-let* ((eat-terminal)
+                (process (eat-term-parameter eat-terminal 'eat--process)))
+      (process-send-string process text))))
+
+(defun eat-pty-win--hangul-buffer ()
+  "Return the persistent Hangul composition buffer."
+  (unless (buffer-live-p eat-pty-win--hangul-buffer)
+    (setq-local eat-pty-win--hangul-buffer
+                (generate-new-buffer " *eat-pty-win-hangul*"))
+    (with-current-buffer eat-pty-win--hangul-buffer
+      (require 'hangul)
+      (setq-local hangul-queue (make-vector 6 0))
+      (quail-setup-overlays nil)))
+  eat-pty-win--hangul-buffer)
+
+(defun eat-pty-win--update-hangul (text)
+  "Replace the Hangul composition displayed in the terminal with TEXT."
+  (let* ((old eat-pty-win--hangul-displayed)
+         (limit (min (length old) (length text)))
+         (prefix 0))
+    (while (and (< prefix limit)
+                (= (aref old prefix) (aref text prefix)))
+      (cl-incf prefix))
+    (eat-pty-win--send-text
+     (concat (make-string (- (length old) prefix) ?\177)
+             (substring text prefix)))
+    (setq eat-pty-win--hangul-displayed text)))
+
+(defun eat-pty-win--reset-hangul ()
+  "Commit and reset the internal Hangul composition state."
+  (when (buffer-live-p eat-pty-win--hangul-buffer)
+    (with-current-buffer eat-pty-win--hangul-buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (setq-local hangul-queue (make-vector 6 0))
+        (quail-setup-overlays nil))))
+  (setq eat-pty-win--hangul-displayed ""))
+
+(defun eat-pty-win--input-method (key)
+  "Incrementally compose Korean Hangul input for the terminal."
+  (if (and (equal current-input-method "korean-hangul")
+           (hangul-alphabetp key))
+      (let ((text
+             (with-current-buffer (eat-pty-win--hangul-buffer)
+               (let ((input-method-function nil))
+                 (hangul2-input-method-internal key))
+               (buffer-string))))
+        (eat-pty-win--update-hangul text)
+        nil)
+    (eat-pty-win--reset-hangul)
+    (list key)))
+
+(defun eat-pty-win--wrap-input-method ()
+  "Install terminal-safe handling for the active Korean input method."
+  (when (and (equal current-input-method "korean-hangul")
+             input-method-function
+             (not (eq input-method-function #'eat-pty-win--input-method)))
+    (setq eat-pty-win--original-input-method-function input-method-function)
+    (setq-local input-method-function #'eat-pty-win--input-method)))
+
+(defun eat-pty-win--input-method-activated ()
+  "Configure an input method activated in an eat-pty-win buffer."
+  (when eat-pty-win-mode
+    (eat-pty-win--wrap-input-method)))
+
+(defun eat-pty-win--send-backspace ()
+  "Delete one Hangul Jaso or send a normal terminal Backspace."
+  (interactive)
+  (if (and (equal current-input-method "korean-hangul")
+           (not (string-empty-p eat-pty-win--hangul-displayed)))
+      (let ((text
+             (with-current-buffer (eat-pty-win--hangul-buffer)
+               (hangul-delete-backward-char)
+               (buffer-string))))
+        (eat-pty-win--update-hangul text))
+    (eat-self-input 1 ?\177)))
+
+(defun eat-pty-win--setup-character-widths ()
+  "Use terminal-compatible widths for ambiguous TUI drawing characters."
+  (setq-local char-width-table (copy-sequence char-width-table))
+  (dolist (range '((#x2190 . #x21ff)
+                   (#x2500 . #x259f)
+                   (#x25a0 . #x25ff)))
+    (set-char-table-range char-width-table range 1))
+  (dolist (character '(#x00b7 #x2026 #x276f))
+    (set-char-table-range char-width-table character 1)))
+
+(defun eat-pty-win--cleanup-buffer ()
+  "Clean up helper state owned by the current terminal buffer."
+  (when (buffer-live-p eat-pty-win--hangul-buffer)
+    (kill-buffer eat-pty-win--hangul-buffer))
+  (setq eat-pty-win--hangul-buffer nil))
+
+(defun eat-pty-win--suspend-rendering (process reason)
+  "Suspend rendering from PROCESS after REASON."
+  (setq eat-pty-win--rendering-suspended t)
+  (setq eat-pty-win--rendering-suspend-reason reason)
+  (setq eat-pty-win--bridge-paused t)
+  (eat-pty-win--cancel-bridge-resume-timer)
+  (eat-pty-win--cancel-ack-timer)
+  (eat-pty-win--clear-output-queue)
+  (eat-pty-win--send-flow-command process "pause")
+  (message "eat-pty-win rendering suspended: %s; use C-c C-k to stop the terminal"
+           reason))
+
+(defun eat-pty-win--process-output-interruptibly (process output)
+  "Render OUTPUT from PROCESS, suspending the terminal when `C-g' interrupts."
+  (condition-case nil
+      (progn
+        (let ((eat-pty-win--processing-output t))
+          (eat-term-process-output eat-terminal output))
+        t)
+    (quit
+     (eat-pty-win--suspend-rendering process "interrupted with C-g")
+     nil)))
+
 (defun eat-pty-win--emergency-keymap (base-map)
   "Return BASE-MAP plus eat-pty-win emergency bindings."
   (let ((map (copy-keymap base-map)))
+    (define-key map [?\C-g] #'keyboard-quit)
+    (define-key map (kbd "DEL") #'eat-pty-win--send-backspace)
+    (define-key map (kbd "<backspace>") #'eat-pty-win--send-backspace)
     (define-key map [?\C-c] (make-sparse-keymap))
+    (define-key map [?\C-c ?\C-c] #'eat-pty-win-send-ctrl-c)
     (define-key map [?\C-c ?\C-k] #'eat-pty-win-kill-process)
     (define-key map [?\C-c ?\C-e] #'eat-emacs-mode)
     (define-key map [?\C-c ?\C-j] #'eat-semi-char-mode)
@@ -257,7 +458,8 @@ triggered Eat stalls on Windows."
   (when (buffer-live-p (process-buffer process))
     (with-current-buffer (process-buffer process)
       (let ((sync-windows (eat--synchronize-scroll-windows))
-            (eat--auto-line-mode-pending-toggles nil))
+            (eat--auto-line-mode-pending-toggles nil)
+            (render-ok t))
         (save-restriction
           (widen)
           (let ((inhibit-read-only t)
@@ -271,32 +473,37 @@ triggered Eat stalls on Windows."
               (setq eat--shell-prompt-annotation-correction-timer nil))
             (setq eat--output-queue-first-chunk-time nil)
             (dolist (output outputs)
-              (eat-term-process-output eat-terminal output))
-            (eat-term-redisplay eat-terminal)
-            (when (and eat-term-scrollback-size
-                       (< eat-term-scrollback-size
-                          (- (point) (point-min))))
-              (delete-region
-               (point-min)
-               (max (point-min)
-                    (- (eat-term-display-beginning eat-terminal)
-                       eat-term-scrollback-size))))
-            (unless (> (length eat-pty-win--pending-output) 0)
-              (setq eat--shell-prompt-annotation-correction-timer
-                    (run-with-timer
-                     eat-shell-prompt-annotation-correction-delay
-                     nil #'eat--correct-shell-prompt-mark-overlays
-                     (current-buffer))))
-            (add-text-properties
-             (eat-term-beginning eat-terminal)
-             (eat-term-end eat-terminal)
-             `(read-only t field eat-terminal
-                         ,@(when eat--line-mode
-                             '(front-sticky t rear-nonsticky t))))))
-        (eat--line-mode-do-toggles)
-        (funcall eat--synchronize-scroll-function sync-windows)
-        (eat-pty-win--schedule-output-ack (current-buffer) process)
-        (run-hooks 'eat-update-hook)))))
+              (when render-ok
+                (setq render-ok
+                      (eat-pty-win--process-output-interruptibly
+                       process output))))
+            (when render-ok
+              (eat-term-redisplay eat-terminal)
+              (when (and eat-term-scrollback-size
+                         (< eat-term-scrollback-size
+                            (- (point) (point-min))))
+                (delete-region
+                 (point-min)
+                 (max (point-min)
+                      (- (eat-term-display-beginning eat-terminal)
+                         eat-term-scrollback-size))))
+              (unless (> (length eat-pty-win--pending-output) 0)
+                (setq eat--shell-prompt-annotation-correction-timer
+                      (run-with-timer
+                       eat-shell-prompt-annotation-correction-delay
+                       nil #'eat--correct-shell-prompt-mark-overlays
+                       (current-buffer))))
+              (add-text-properties
+               (eat-term-beginning eat-terminal)
+               (eat-term-end eat-terminal)
+               `(read-only t field eat-terminal
+                           ,@(when eat--line-mode
+                               '(front-sticky t rear-nonsticky t)))))))
+        (when render-ok
+          (eat--line-mode-do-toggles)
+          (funcall eat--synchronize-scroll-function sync-windows)
+          (eat-pty-win--schedule-output-ack (current-buffer) process)
+          (run-hooks 'eat-update-hook))))))
 
 (defun eat-pty-win--drain-output (buffer process)
   "Drain one queued output chunk for BUFFER from PROCESS."
@@ -304,6 +511,7 @@ triggered Eat stalls on Windows."
     (with-current-buffer buffer
       (setq eat-pty-win--output-timer nil)
       (when (and (process-live-p process)
+                 (not eat-pty-win--rendering-suspended)
                  (> (length eat-pty-win--pending-output) 0)
                  (not (input-pending-p)))
         (let ((deadline (+ (float-time)
@@ -320,7 +528,8 @@ triggered Eat stalls on Windows."
               (push output outputs)))
           (when outputs
             (eat-pty-win--process-output-batch process (nreverse outputs)))))
-      (when (> (length eat-pty-win--pending-output) 0)
+      (when (and (not eat-pty-win--rendering-suspended)
+                 (> (length eat-pty-win--pending-output) 0))
         (setq eat-pty-win--output-timer
               (run-at-time eat-pty-win-output-throttle-delay nil
                            #'eat-pty-win--drain-output
@@ -329,7 +538,8 @@ triggered Eat stalls on Windows."
 (defun eat-pty-win--schedule-output-drain (buffer process)
   "Schedule bounded output draining for BUFFER and PROCESS."
   (with-current-buffer buffer
-    (unless eat-pty-win--output-timer
+    (unless (or eat-pty-win--rendering-suspended
+                eat-pty-win--output-timer)
       (setq eat-pty-win--output-timer
             (run-at-time eat-pty-win-output-throttle-delay nil
                          #'eat-pty-win--drain-output
@@ -339,7 +549,8 @@ triggered Eat stalls on Windows."
   "Queue PROCESS OUTPUT and render it in bounded chunks."
   (when (buffer-live-p (process-buffer process))
     (with-current-buffer (process-buffer process)
-      (unless (eat-pty-win--record-filter-call process)
+      (unless (or eat-pty-win--rendering-suspended
+                  (eat-pty-win--record-filter-call process))
         (when (> (length output) eat-pty-win-output-max-pending-bytes)
           (setq output
                 (substring output
@@ -421,7 +632,13 @@ triggered Eat stalls on Windows."
                         (pcase eat-pty-win-sanitize-ui-glyphs
                           ('auto "auto")
                           ('nil "0")
-                          (_ "1"))))
+                          (_ "1")))
+                (format "EAT_PTY_WIN_ACK_TIMEOUT_MS=%d"
+                        (round (* 1000 eat-pty-win-output-ack-timeout)))
+                (concat "EAT_PTY_WIN_DIAGNOSTIC_FILE="
+                        (if eat-pty-win-diagnostic-file
+                            (expand-file-name eat-pty-win-diagnostic-file)
+                          "")))
                process-environment))
              (inhibit-eol-conversion t)
              (process
@@ -501,8 +718,21 @@ triggered Eat stalls on Windows."
   :keymap eat-pty-win-mode-map
   (if eat-pty-win-mode
       (progn
+        (setq eat-pty-win--rendering-suspended nil)
+        (setq eat-pty-win--rendering-suspend-reason nil)
+        (eat-pty-win--setup-character-widths)
+        (when (bound-and-true-p centered-cursor-mode)
+          (centered-cursor-mode -1))
         (display-line-numbers-mode -1)
         (eat-pty-win--install-emergency-keys)
+        (define-key eat-pty-win-mode-map (kbd "DEL")
+                    #'eat-pty-win--send-backspace)
+        (define-key eat-pty-win-mode-map (kbd "<backspace>")
+                    #'eat-pty-win--send-backspace)
+        (add-hook 'input-method-activate-hook
+                  #'eat-pty-win--input-method-activated nil t)
+        (add-hook 'kill-buffer-hook #'eat-pty-win--cleanup-buffer nil t)
+        (eat-pty-win--wrap-input-method)
         (add-hook 'window-size-change-functions
                   #'eat-pty-win--window-size-change)
         (run-at-time 0.05 nil
@@ -516,6 +746,10 @@ triggered Eat stalls on Windows."
     (eat-pty-win--cancel-bridge-resume-timer)
     (eat-pty-win--cancel-ack-timer)
     (eat-pty-win--clear-output-queue)
+    (remove-hook 'input-method-activate-hook
+                 #'eat-pty-win--input-method-activated t)
+    (remove-hook 'kill-buffer-hook #'eat-pty-win--cleanup-buffer t)
+    (eat-pty-win--cleanup-buffer)
     (eat-pty-win--uninstall-emergency-keys)))
 
 (defun eat-pty-win--display-buffer (buffer side-window)

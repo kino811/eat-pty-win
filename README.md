@@ -80,8 +80,49 @@ Mode keys:
 C-c C-l    eat-line-mode
 C-c C-j    eat-semi-char-mode
 C-c M-d    eat-char-mode
+C-c C-c    send Ctrl+C to the terminal process
 C-c C-k    eat-kill-process
+C-g        interrupt stalled Eat rendering
 ```
+
+The package supports incremental Emacs `korean-hangul` input in semi-char and
+char modes.  Hangul composition is sent directly to ConPTY instead of inserting
+text into the terminal buffer.
+
+## TUI output handling
+
+`eat-pty-win` applies bounded output flow control so continuously redrawing
+applications do not overwhelm Emacs.  It also works around an Eat 0.9.4 loop
+that can occur when a character wider than one column starts in the final
+terminal column.  This is relevant on Windows because the GUI character-width
+table can classify box-drawing and block characters used by applications such
+as Copilot CLI as two columns.  `eat-pty-win` uses terminal-compatible
+single-column widths for ambiguous drawing characters without changing the
+width of Korean text.
+
+Unicode output is preserved by default, including Korean text and TUI drawing
+characters.  If a separate rendering issue requires ASCII-safe drawing
+characters, enable the optional bridge sanitizer:
+
+```elisp
+(setq eat-pty-win-sanitize-ui-glyphs 'auto)
+```
+
+If an unknown Eat parser loop occurs, press `C-g`.  Rendering for that terminal
+is suspended, the bridge remains paused, and Emacs returns to the command loop.
+Use `C-c C-k` to terminate the affected terminal.  Rendering is not resumed
+automatically because the terminal state may have been only partially updated.
+
+For diagnosing a stall, configure a local file before opening the terminal:
+
+```elisp
+(setq eat-pty-win-diagnostic-file
+      (expand-file-name ".diagnostics/eat-pty-win-stalled-output.log"
+                        user-emacs-directory))
+```
+
+The bridge writes the last unacknowledged output chunk after three seconds.
+This file can contain terminal text and is therefore disabled by default.
 
 ## Security notes
 

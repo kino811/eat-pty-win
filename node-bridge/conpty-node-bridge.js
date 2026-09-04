@@ -2,6 +2,8 @@
 'use strict';
 
 const os = require('os');
+const fs = require('fs');
+const path = require('path');
 const pty = require('node-pty');
 
 const resizePrefix = '\x1b]777;resize;';
@@ -13,6 +15,11 @@ const outputLowWatermark = 16 * 1024;
 const outputMaxBuffer = 256 * 1024;
 const stripUnsafeSequences = process.env.EAT_PTY_WIN_STRIP_UNSAFE !== '0';
 const sanitizeUiGlyphsMode = process.env.EAT_PTY_WIN_SANITIZE_UI_GLYPHS || 'auto';
+const outputAckTimeoutMs = Math.max(
+  100,
+  Number(process.env.EAT_PTY_WIN_ACK_TIMEOUT_MS) || 3000
+);
+const diagnosticFile = process.env.EAT_PTY_WIN_DIAGNOSTIC_FILE || '';
 let sanitizeUiGlyphsUntil = 0;
 
 function parseArgs(argv) {
@@ -170,6 +177,35 @@ let outputTimer = null;
 let stdoutBlocked = false;
 let ptyPaused = false;
 let waitingForAck = false;
+let outputAckTimer = null;
+let lastOutputChunk = '';
+
+function clearOutputAckTimer() {
+  if (outputAckTimer !== null) {
+    clearTimeout(outputAckTimer);
+    outputAckTimer = null;
+  }
+}
+
+function recordUnacknowledgedChunk() {
+  outputAckTimer = null;
+  if (!waitingForAck || diagnosticFile === '') {
+    return;
+  }
+
+  fs.mkdirSync(path.dirname(diagnosticFile), { recursive: true });
+  fs.writeFileSync(
+    diagnosticFile,
+    `timestamp=${new Date().toISOString()}\n${lastOutputChunk}`,
+    'utf8'
+  );
+}
+
+function scheduleOutputAckTimeout(chunk) {
+  clearOutputAckTimer();
+  lastOutputChunk = chunk;
+  outputAckTimer = setTimeout(recordUnacknowledgedChunk, outputAckTimeoutMs);
+}
 
 function pausePty() {
   if (!ptyPaused) {
@@ -186,6 +222,7 @@ function resumePtyIfSafe() {
 }
 
 function forceResumePty() {
+  clearOutputAckTimer();
   waitingForAck = false;
   if (ptyPaused && !stdoutBlocked) {
     term.resume();
@@ -195,6 +232,7 @@ function forceResumePty() {
 }
 
 function acknowledgeOutput() {
+  clearOutputAckTimer();
   waitingForAck = false;
   resumePtyIfSafe();
   scheduleOutputFlush();
@@ -228,6 +266,7 @@ function flushOutput() {
   }
 
   waitingForAck = true;
+  scheduleOutputAckTimeout(chunk);
   pausePty();
   resumePtyIfSafe();
 
@@ -257,6 +296,7 @@ process.stdout.on('drain', () => {
 });
 
 term.onExit(({ exitCode }) => {
+  clearOutputAckTimer();
   process.exitCode = exitCode ?? 0;
   process.exit();
 });
