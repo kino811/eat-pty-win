@@ -81,6 +81,7 @@ C-c C-l    eat-line-mode
 C-c C-j    eat-semi-char-mode
 C-c M-d    eat-char-mode
 C-c C-c    send Ctrl+C to the terminal process
+C-j/S-RET  send Shift+Enter for Copilot CLI multiline input
 C-c C-k    eat-kill-process
 C-g        interrupt stalled Eat rendering
 ```
@@ -99,6 +100,10 @@ table can classify box-drawing and block characters used by applications such
 as Copilot CLI as two columns.  `eat-pty-win` uses terminal-compatible
 single-column widths for ambiguous drawing characters without changing the
 width of Korean text.
+
+The bridge coalesces up to 16 KiB of output per acknowledgement.  This keeps a
+typical full-screen TUI redraw in one Emacs redisplay instead of exposing a
+partially rendered frame between smaller chunks.
 
 Unicode output is preserved by default, including Korean text and TUI drawing
 characters.  If a separate rendering issue requires ASCII-safe drawing

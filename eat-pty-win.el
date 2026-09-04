@@ -113,7 +113,7 @@ The default nil keeps the user's PowerShell profile setting."
 This keeps Emacs responsive when full-screen TUIs redraw continuously."
   :type 'number)
 
-(defcustom eat-pty-win-output-chunk-size 4096
+(defcustom eat-pty-win-output-chunk-size 16384
   "Maximum bytes of terminal output rendered in one drain pass."
   :type 'integer)
 
@@ -188,6 +188,8 @@ replaces box drawing and spinner symbols."
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-g") #'keyboard-quit)
     (define-key map (kbd "C-c C-c") #'eat-pty-win-send-ctrl-c)
+    (define-key map (kbd "C-j") #'eat-pty-win-send-shift-return)
+    (define-key map (kbd "<S-return>") #'eat-pty-win-send-shift-return)
     (define-key map (kbd "C-c C-l") #'eat-line-mode)
     (define-key map (kbd "C-c C-j") #'eat-semi-char-mode)
     (define-key map (kbd "C-c M-d") #'eat-char-mode)
@@ -296,6 +298,12 @@ replaces box drawing and spinner symbols."
   (interactive)
   (eat-pty-win--reset-hangul)
   (eat-pty-win--send-text "\C-c"))
+
+(defun eat-pty-win-send-shift-return ()
+  "Send Shift+Enter using Copilot CLI's multiline input sequence."
+  (interactive)
+  (eat-pty-win--reset-hangul)
+  (eat-pty-win--send-text "\e\r"))
 
 (defun eat-pty-win--send-text (text)
   "Send TEXT directly to the terminal process."
@@ -422,6 +430,8 @@ replaces box drawing and spinner symbols."
     (define-key map [?\C-g] #'keyboard-quit)
     (define-key map (kbd "DEL") #'eat-pty-win--send-backspace)
     (define-key map (kbd "<backspace>") #'eat-pty-win--send-backspace)
+    (define-key map (kbd "C-j") #'eat-pty-win-send-shift-return)
+    (define-key map (kbd "<S-return>") #'eat-pty-win-send-shift-return)
     (define-key map [?\C-c] (make-sparse-keymap))
     (define-key map [?\C-c ?\C-c] #'eat-pty-win-send-ctrl-c)
     (define-key map [?\C-c ?\C-k] #'eat-pty-win-kill-process)
@@ -635,6 +645,8 @@ replaces box drawing and spinner symbols."
                           (_ "1")))
                 (format "EAT_PTY_WIN_ACK_TIMEOUT_MS=%d"
                         (round (* 1000 eat-pty-win-output-ack-timeout)))
+                (format "EAT_PTY_WIN_OUTPUT_CHUNK_SIZE=%d"
+                        eat-pty-win-output-chunk-size)
                 (concat "EAT_PTY_WIN_DIAGNOSTIC_FILE="
                         (if eat-pty-win-diagnostic-file
                             (expand-file-name eat-pty-win-diagnostic-file)

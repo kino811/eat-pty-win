@@ -9,7 +9,10 @@ const pty = require('node-pty');
 const resizePrefix = '\x1b]777;resize;';
 const flowPrefix = '\x1b]777;flow;';
 const outputFlushIntervalMs = 5;
-const outputChunkSize = 4096;
+const outputChunkSize = Math.max(
+  4096,
+  Number(process.env.EAT_PTY_WIN_OUTPUT_CHUNK_SIZE) || 16384
+);
 const outputHighWatermark = 64 * 1024;
 const outputLowWatermark = 16 * 1024;
 const outputMaxBuffer = 256 * 1024;
