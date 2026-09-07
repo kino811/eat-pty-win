@@ -98,12 +98,32 @@ that can occur when a character wider than one column starts in the final
 terminal column.  This is relevant on Windows because the GUI character-width
 table can classify box-drawing and block characters used by applications such
 as Copilot CLI as two columns.  `eat-pty-win` uses terminal-compatible
-single-column widths for ambiguous drawing characters without changing the
-width of Korean text.
+single-column widths for ambiguous drawing characters and general punctuation
+without changing the width of Korean text.
 
-The bridge coalesces up to 16 KiB of output per acknowledgement.  This keeps a
-typical full-screen TUI redraw in one Emacs redisplay instead of exposing a
-partially rendered frame between smaller chunks.
+The bridge coalesces up to 64 KiB of output per acknowledgement.  This keeps a
+full-screen TUI redraw intact when changing between one and two windows instead
+of exposing a partially rendered frame between smaller chunks.
+
+### Resize synchronization
+
+Emacs can report several transient dimensions while windows are split, merged,
+or resized.  Full-screen TUIs such as Copilot CLI can redraw at the same time,
+so applying each transient size to Eat and ConPTY can mix output for one grid
+size with another grid.
+
+`eat-pty-win` records the latest requested size and waits until terminal output
+has been idle for `eat-pty-win-resize-delay` seconds (0.25 by default).  It then
+resizes Eat and ConPTY together to that final size.  This prevents Copilot CLI
+session restoration from leaving its cursor or input area at a stale position
+when the Emacs window layout changes.
+
+This is an output-idle synchronization policy rather than a full resize
+transaction.  If a future TUI still corrupts its display during resize, evolve
+the bridge protocol to pause output, drain and acknowledge in-flight output,
+resize Eat and ConPTY with a generation identifier, acknowledge the applied
+size, and then resume output.  Do not work around that case by adding more
+independent resize hooks or timers.
 
 Unicode output is preserved by default, including Korean text and TUI drawing
 characters.  If a separate rendering issue requires ASCII-safe drawing

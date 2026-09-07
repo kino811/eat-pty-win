@@ -113,9 +113,13 @@ The default nil keeps the user's PowerShell profile setting."
 This keeps Emacs responsive when full-screen TUIs redraw continuously."
   :type 'number)
 
-(defcustom eat-pty-win-output-chunk-size 16384
+(defcustom eat-pty-win-output-chunk-size 65536
   "Maximum bytes of terminal output rendered in one drain pass."
   :type 'integer)
+
+(defcustom eat-pty-win-resize-delay 0.25
+  "Seconds of terminal output idle time before applying a resize."
+  :type 'number)
 
 (defcustom eat-pty-win-output-drain-time-budget 0.02
   "Maximum seconds spent rendering terminal output in one timer pass."
@@ -168,6 +172,9 @@ replaces box drawing and spinner symbols."
                  (const :tag "Disabled" nil)))
 
 (defvar-local eat-pty-win--last-size nil)
+(defvar-local eat-pty-win--resize-timer nil)
+(defvar-local eat-pty-win--resize-process nil)
+(defvar-local eat-pty-win--resize-windows nil)
 (defvar-local eat-pty-win--pending-output "")
 (defvar-local eat-pty-win--output-timer nil)
 (defvar-local eat-pty-win--output-dropped nil)
@@ -388,7 +395,8 @@ replaces box drawing and spinner symbols."
 (defun eat-pty-win--setup-character-widths ()
   "Use terminal-compatible widths for ambiguous TUI drawing characters."
   (setq-local char-width-table (copy-sequence char-width-table))
-  (dolist (range '((#x2190 . #x21ff)
+  (dolist (range '((#x2000 . #x206f)
+                   (#x2190 . #x21ff)
                    (#x2500 . #x259f)
                    (#x25a0 . #x25ff)))
     (set-char-table-range char-width-table range 1))
@@ -512,6 +520,10 @@ replaces box drawing and spinner symbols."
         (when render-ok
           (eat--line-mode-do-toggles)
           (funcall eat--synchronize-scroll-function sync-windows)
+          (when (and eat-pty-win--resize-timer
+                     eat-pty-win--resize-process)
+            (eat-pty-win--schedule-resize
+             eat-pty-win--resize-process eat-pty-win--resize-windows))
           (eat-pty-win--schedule-output-ack (current-buffer) process)
           (run-hooks 'eat-update-hook))))))
 
@@ -664,7 +676,7 @@ replaces box drawing and spinner symbols."
                :sentinel #'eat-pty-win--sentinel
                :file-handler t)))
         (process-put process 'adjust-window-size-function
-                     #'eat--adjust-process-window-size)
+                     #'eat-pty-win--adjust-process-window-size)
         (set-process-query-on-exit-flag
          process eat-query-before-killing-running-terminal)
         (goto-char (point-max))
@@ -704,10 +716,10 @@ replaces box drawing and spinner symbols."
            (format "if (Get-Command Set-PSReadLineOption -ErrorAction SilentlyContinue) { Set-PSReadLineOption -EditMode %s }"
                    eat-pty-win-powershell-edit-mode)))))
 
-(defun eat-pty-win--send-resize (&optional process)
-  "Tell bridge PROCESS about the current window size."
+(defun eat-pty-win--send-resize (&optional process size)
+  "Tell bridge PROCESS about SIZE, or the current window size."
   (let* ((proc (or process (get-buffer-process (current-buffer))))
-         (size (eat-pty-win--buffer-size)))
+         (size (or size (eat-pty-win--buffer-size))))
     (when (and proc
                (process-live-p proc)
                (not (equal size eat-pty-win--last-size)))
@@ -716,13 +728,51 @@ replaces box drawing and spinner symbols."
        proc
        (format "\e]777;resize;%d;%d\a" (car size) (cdr size))))))
 
-(defun eat-pty-win--window-size-change (frame)
-  "Propagate window size changes for visible eat-pty-win buffers."
-  (dolist (window (window-list frame 'no-minibuf))
-    (with-current-buffer (window-buffer window)
-      (when (derived-mode-p 'eat-mode)
-        (when (bound-and-true-p eat-pty-win-mode)
-          (eat-pty-win--send-resize))))))
+(defun eat-pty-win--cancel-resize-timer ()
+  "Cancel the pending coalesced ConPTY resize."
+  (when (timerp eat-pty-win--resize-timer)
+    (cancel-timer eat-pty-win--resize-timer))
+  (setq eat-pty-win--resize-timer nil))
+
+(defun eat-pty-win--run-resize (buffer)
+  "Apply BUFFER's pending Eat and ConPTY resize."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq eat-pty-win--resize-timer nil)
+      (let ((process eat-pty-win--resize-process)
+            (windows eat-pty-win--resize-windows))
+        (setq eat-pty-win--resize-process nil)
+        (setq eat-pty-win--resize-windows nil)
+        (when (and (bound-and-true-p eat-pty-win-mode)
+                   (process-live-p process)
+                   (eq (process-buffer process) buffer))
+          (when-let ((size (eat--adjust-process-window-size
+                            process windows)))
+            (eat-pty-win--send-resize process size)))))))
+
+(defun eat-pty-win--schedule-resize (process windows)
+  "Resize PROCESS after window layout and terminal output have settled."
+  (setq eat-pty-win--resize-process process)
+  (setq eat-pty-win--resize-windows windows)
+  (eat-pty-win--cancel-resize-timer)
+  (setq eat-pty-win--resize-timer
+        (run-at-time
+         eat-pty-win-resize-delay nil
+         #'eat-pty-win--run-resize
+         (current-buffer))))
+
+(defun eat-pty-win--adjust-process-window-size (process windows)
+  "Coalesce Eat and ConPTY resize bursts caused by window layout changes.
+
+Both resize operations wait until transient dimensions from splitting or
+merging windows have settled.  This prevents an intermediate grid size from
+being rendered without a matching Copilot redraw."
+  (with-current-buffer (process-buffer process)
+    (let ((size (funcall window-adjust-process-window-size-function
+                         process windows)))
+      (when (and size (bound-and-true-p eat-pty-win-mode))
+        (eat-pty-win--schedule-resize process windows))
+      size)))
 
 (define-minor-mode eat-pty-win-mode
   "Minor mode for Eat buffers backed by Windows ConPTY."
@@ -745,18 +795,15 @@ replaces box drawing and spinner symbols."
                   #'eat-pty-win--input-method-activated nil t)
         (add-hook 'kill-buffer-hook #'eat-pty-win--cleanup-buffer nil t)
         (eat-pty-win--wrap-input-method)
-        (add-hook 'window-size-change-functions
-                  #'eat-pty-win--window-size-change)
         (run-at-time 0.05 nil
                      (lambda (buffer)
                        (when (buffer-live-p buffer)
                          (with-current-buffer buffer
                            (eat-pty-win--send-resize))))
                      (current-buffer)))
-    (remove-hook 'window-size-change-functions
-                 #'eat-pty-win--window-size-change)
     (eat-pty-win--cancel-bridge-resume-timer)
     (eat-pty-win--cancel-ack-timer)
+    (eat-pty-win--cancel-resize-timer)
     (eat-pty-win--clear-output-queue)
     (remove-hook 'input-method-activate-hook
                  #'eat-pty-win--input-method-activated t)
