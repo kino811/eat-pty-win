@@ -192,16 +192,24 @@ function clearOutputAckTimer() {
 
 function recordUnacknowledgedChunk() {
   outputAckTimer = null;
-  if (!waitingForAck || diagnosticFile === '') {
+  if (!waitingForAck) {
     return;
   }
 
-  fs.mkdirSync(path.dirname(diagnosticFile), { recursive: true });
-  fs.writeFileSync(
-    diagnosticFile,
-    `timestamp=${new Date().toISOString()}\n${lastOutputChunk}`,
-    'utf8'
-  );
+  if (diagnosticFile !== '') {
+    fs.mkdirSync(path.dirname(diagnosticFile), { recursive: true });
+    fs.writeFileSync(
+      diagnosticFile,
+      `timestamp=${new Date().toISOString()}\n${lastOutputChunk}`,
+      'utf8'
+    );
+  }
+
+  // The timed-out chunk was already sent to Emacs.  Do not replay terminal
+  // controls; release flow control so a missing ACK cannot deadlock the PTY.
+  waitingForAck = false;
+  resumePtyIfSafe();
+  scheduleOutputFlush();
 }
 
 function scheduleOutputAckTimeout(chunk) {
